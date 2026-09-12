@@ -62,7 +62,7 @@ const upload = multer({ storage: storage });
 
 // Register/Login User
 app.post('/api/register', (req, res) => {
-  const { phone, username } = req.body;
+  const { phone, username, avatarUrl } = req.body;
   if (!phone || !username) {
     return res.status(400).json({ error: "Phone and username are required" });
   }
@@ -74,18 +74,52 @@ app.post('/api/register', (req, res) => {
     db.users[cleanPhone] = {
       phone: cleanPhone,
       username: username.trim(),
+      avatarUrl: avatarUrl || null,
       joinedAt: Date.now()
     };
     saveDb();
     console.log(`Registered new user: ${username} (${cleanPhone})`);
   } else {
-    // Update username if user already exists
+    // Update username and avatar if provided
     db.users[cleanPhone].username = username.trim();
+    if (avatarUrl) {
+      db.users[cleanPhone].avatarUrl = avatarUrl;
+    }
     saveDb();
     console.log(`Logged in user: ${username} (${cleanPhone})`);
   }
 
   res.json(db.users[cleanPhone]);
+});
+
+// Update Profile Avatar
+app.post('/api/user/avatar', (req, res) => {
+  const { phone, avatarUrl } = req.body;
+  if (!phone || !avatarUrl) {
+    return res.status(400).json({ error: "Phone and avatarUrl are required" });
+  }
+
+  const cleanPhone = phone.trim().replace(/\s+/g, '');
+  if (db.users[cleanPhone]) {
+    db.users[cleanPhone].avatarUrl = avatarUrl;
+    saveDb();
+    console.log(`Updated avatar for user ${cleanPhone}: ${avatarUrl}`);
+
+    // Broadcast avatar update to all connected clients
+    const updateEvent = JSON.stringify({
+      type: 'user_update',
+      user: db.users[cleanPhone]
+    });
+    for (const clientWs of clients.values()) {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(updateEvent);
+      }
+    }
+
+    return res.json(db.users[cleanPhone]);
+  }
+
+  res.status(404).json({ error: "User not found" });
 });
 
 // Get all users
@@ -109,6 +143,47 @@ app.get('/api/messages', (req, res) => {
   );
 
   res.json(chatMessages);
+});
+
+// Send message via HTTP (fallback/guaranteed endpoint)
+app.post('/api/messages/send', (req, res) => {
+  const { id, sender, receiver, msgType, content } = req.body;
+  if (!sender || !receiver || !content) {
+    return res.status(400).json({ error: "sender, receiver, and content are required" });
+  }
+
+  const cleanSender = sender.trim().replace(/\s+/g, '');
+  const cleanReceiver = receiver.trim().replace(/\s+/g, '');
+
+  const newMsg = {
+    id: id || `msg-${Date.now()}-${Math.round(Math.random() * 1000)}`,
+    sender: cleanSender,
+    receiver: cleanReceiver,
+    type: msgType || 'text',
+    content: content,
+    timestamp: Date.now()
+  };
+
+  // Avoid duplicates if message with same ID already exists
+  const existingIndex = db.messages.findIndex(m => m.id === newMsg.id);
+  if (existingIndex < 0) {
+    db.messages.push(newMsg);
+    saveDb();
+  }
+
+  // Forward to recipient via WebSocket if online
+  const recipientWs = clients.get(cleanReceiver);
+  if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+    recipientWs.send(JSON.stringify({
+      type: 'chat',
+      message: newMsg
+    }));
+    console.log(`HTTP Send: Forwarded message from ${cleanSender} to online user ${cleanReceiver}`);
+  } else {
+    console.log(`HTTP Send: Stored message from ${cleanSender} to offline user ${cleanReceiver}`);
+  }
+
+  res.json({ status: 'sent', message: newMsg });
 });
 
 // Upload media file (image/video)
